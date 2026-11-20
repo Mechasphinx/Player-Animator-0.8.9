@@ -111,6 +111,21 @@ dialog { background: var(--panel); color: var(--text); border: 1px solid var(--l
 dialog::backdrop { background: #0009; }
 dialog h3 { margin: 0 0 10px; }
 dialog em { color: var(--dim); font-style: normal; }
+#askText, #askMore { white-space: pre-line; }
+#askMore { color: var(--dim); border-left: 2px solid var(--accent); padding-left: 10px; }
+.askMoreBtn { margin-right: auto; background: none; border-color: transparent; color: var(--accent-text); }
+.ctxMenu { position: fixed; z-index: 30; min-width: 200px; max-width: 280px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 10px 28px #000a; display: flex; flex-direction: column; }
+.ctxMenu button { background: none; border: 0; border-radius: 3px; text-align: left; padding: 5px 10px 5px 26px; position: relative; white-space: nowrap; }
+.ctxMenu button:hover:not(:disabled), .ctxMenu button:focus-visible { background: var(--accent-soft); color: var(--accent-pale); outline: none; }
+.ctxMenu button[aria-checked=true]::before { content: "✓"; position: absolute; left: 9px; color: var(--accent-text); }
+.ctxMenu .elab { font-weight: 600; color: var(--accent-text); }
+.ctxMenu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 3px; }
+.ctxMenu .label { color: var(--dim); font-size: 11px; padding: 4px 10px 2px; text-transform: uppercase; letter-spacing: .06em; }
+.eye { flex: none; border: 0; background: none; padding: 0 2px; color: var(--dim); display: flex; }
+.eye svg { width: 15px; height: 15px; }
+.eye:hover { color: var(--text); background: none; }
+.eye.shut { color: #616977; }
+.item.hiddenPiece .grow { opacity: .45; text-decoration: line-through; }
 #askInput { width: 100%; padding: 5px 7px; }
 </style>
 </head>
@@ -203,6 +218,10 @@ dialog em { color: var(--dim); font-style: normal; }
         <label>X2 <input type="number" data-bn="2" step="0.05" aria-label="Second handle, time"></label>
         <label>Y2 <input type="number" data-bn="3" step="0.05" aria-label="Second handle, motion"></label>
       </div>
+      <div class="row2">
+        <button id="bezCopy" title="Copy this curve's numbers (Ctrl+Shift+C)">Copy curve</button>
+        <button id="bezPaste" title="Put the copied curve on the selected keys (Ctrl+Shift+V)">Paste curve</button>
+      </div>
       <div class="bezPresets">
         <button data-bez="0,0,1,1" title="Even speed the whole way">Linear</button>
         <button data-bez="0.25,0.1,0.25,1" title="Quick start, gentle finish">Ease</button>
@@ -256,6 +275,7 @@ dialog em { color: var(--dim); font-style: normal; }
 
 <dialog id="askDlg">
   <p id="askText"></p>
+  <p id="askMore" hidden></p>
   <input id="askInput" aria-label="Name" hidden>
   <div class="row2 end" id="askButtons"></div>
 </dialog>
@@ -604,8 +624,11 @@ const autoTweenOn = a => a.type === 'weapon' && a.autoTween;
 const BODY_PARTS = ['body', 'head', 'right_arm', 'left_arm', 'right_leg', 'left_leg', 'root'];
 
 // The whole animation flipped left-to-right: limbs swap sides, and sideways values invert.
-function mirrorTracks(tracks) {
-  const swap = { right_arm:'left_arm', left_arm:'right_arm', right_leg:'left_leg', left_leg:'right_leg' }, out = {};
+const MIRROR_SWAP = { right_arm:'left_arm', left_arm:'right_arm', right_leg:'left_leg', left_leg:'right_leg' };
+// Flip keeps the weapon in the same hand: each arm mirrors its own motion, while the stance swaps feet like a full mirror.
+const FLIP_SWAP = { right_leg:'left_leg', left_leg:'right_leg' };
+function mirrorTracks(tracks, swap = MIRROR_SWAP) {
+  const out = {};
   const flipX = v => [-v[0], v[1], v[2]];
   for (const part in tracks) out[swap[part] || part] = tracks[part].map(k => Object.assign({}, k, { p:flipX(k.p), r:[k.r[0], -k.r[1], -k.r[2]] }, k.mid ? { mid:{ base:flipX(k.mid.base), tip:flipX(k.mid.tip) } } : {},
     k.via ? { via:k.via.map(v => ({ a:{ p:flipX(v.a.p), r:[v.a.r[0], -v.a.r[1], -v.a.r[2]] }, w:{ p:flipX(v.w.p), r:[v.w.r[0], -v.w.r[1], -v.w.r[2]] } })) } : {}));
@@ -623,6 +646,13 @@ function switchHand(a) {
   const flip = b => b && b.replace(/^(right|left)_/, (m, s) => (s === 'right' ? 'left_' : 'right_'));
   if (a.attach) a.attach = flip(a.attach);
   if (a.offAttach) a.offAttach = flip(a.offAttach);
+}
+
+// Flip is its own undo: flipping twice gives back exactly what was there.
+function flipAnimation(a) {
+  a.tracks = mirrorTracks(a.tracks, FLIP_SWAP);
+  if (a.otherHand) a.otherHand = mirrorTracks(a.otherHand, FLIP_SWAP);
+  a.flipped = !a.flipped;
 }
 
 function setMirrored(a, on) {
@@ -698,7 +728,21 @@ function sampleTrack(keys, t, forceSmooth) {
     const m1 = after ? (after[ch][n]-k0[ch][n])/(after.t-k0.t) : 0;
     return hermite(k0[ch][n], k1[ch][n], m0, m1, h, s);
   };
-  return { p: [mix('p',0),mix('p',1),mix('p',2)], r: [mix('r',0),mix('r',1),mix('r',2)] };
+  return { p: [mix('p',0),mix('p',1),mix('p',2)], r: untwist(k0.r, k1.r, [mix('r',0),mix('r',1),mix('r',2)]) };
+}
+
+// Turning each angle on its own normally follows the direct route, but between two readings of a rotation
+// that differ in all three angles at once (common after a drag near pointing straight up or down) it can
+// corkscrew far off it. Those segments turn along the direct arc instead, at the same pace. Turns of more
+// than a half-turn are deliberate spins and keep their angles.
+function untwist(r0, r1, r) {
+  if (r0.some((v, n) => Math.abs(r1[n]-v) > 175)) return r;
+  const q0 = Q.fromM(rotOf(r0)), q1 = Q.fromM(rotOf(r1)), mid = Q.fromM(rotOf(lerp3(r0, r1, .5))), direct = Q.slerp(q0, q1, .5);
+  const off = 2*Math.acos(clamp(Math.abs(mid[0]*direct[0]+mid[1]*direct[1]+mid[2]*direct[2]+mid[3]*direct[3]), 0, 1))/DEG;
+  if (off < 20) return r;
+  const d = V.sub(r1, r0), len2 = V.dot(d, d), s = len2 > 1e-9 ? clamp(V.dot(V.sub(r, r0), d)/len2, 0, 1) : 0;
+  const e = closestEulerDeg(Q.toM(Q.slerp(q0, q1, s)), [-r[0], -r[1], r[2]]);
+  return [-e[0], -e[1], e[2]];
 }
 
 let cacheVersion = 0;
@@ -724,7 +768,7 @@ function sampleMono(keys, t) {
   const tan = (ch, n, j) => { if (j <= 0 || j >= keys.length-1) return 0; const a = slope(ch,n,j-1), b = slope(ch,n,j); return a*b <= 0 ? 0 : 2*a*b/(a+b); };
   const eased = keys[i].i === 'bezier' ? bezierEase(keys[i].bez, s) : null;
   const mix = (ch, n) => eased !== null ? keys[i][ch][n]+(keys[i+1][ch][n]-keys[i][ch][n])*eased : hermite(keys[i][ch][n], keys[i+1][ch][n], tan(ch,n,i), tan(ch,n,i+1), h, s);
-  return { p:[mix('p',0),mix('p',1),mix('p',2)], r:[mix('r',0),mix('r',1),mix('r',2)] };
+  return { p:[mix('p',0),mix('p',1),mix('p',2)], r:untwist(keys[i].r, keys[i+1].r, [mix('r',0),mix('r',1),mix('r',2)]) };
 }
 
 const rotOf = r => M4.zyx(-r[0]*DEG, -r[1]*DEG, r[2]*DEG);
@@ -1792,7 +1836,7 @@ const App = {
   sel: 'right_arm', tool: 'pose', time: 0, playing: false, speed: 1, snap: 20,
   selKeys: new Set(), clip: null, dir: null, saveHandle: null, hover: null,
   cam: { yaw: Math.PI+.62, pitch: .22, dist: 74, target: [0,17,0], ortho: false },
-  undo: [], redo: [], gesture: false, view: { paths:true, highlight:true, onion:false, hidden:{} },
+  undo: [], redo: [], gesture: false, view: { paths:true, highlight:true, onion:false, hidden:{}, off:{} },
 };
 const R = new Renderer($('gl'));
 const anim = () => App.anims[App.active];
@@ -1934,7 +1978,7 @@ async function checkArcRuns() {
   if (document.querySelector('dialog[open]') || drag || tlDrag) { queueArcCheck(); return; }
   const a = anim(), run = findArcRuns(a).find(r => !(a.noJoin || []).includes(runSignature(r)));
   if (!run) return;
-  const join = await ask('These '+run.length+' keyframes make one continuous arc. Join them into a single swing? The keys in between are removed, so it no longer slows down at each one.', [['Keep separate', false], ['Join into one arc', true]]);
+  const join = await ask('These '+run.length+' keyframes make one continuous arc. Join them into a single swing? The keys in between are removed, so it no longer slows down at each one.', [['Keep separate', false], ['Join into one arc', true]], undefined, EXPLAIN.join);
   if (join === undefined) return;
   if (join) joinRun(a, run);
   else { (a.noJoin = a.noJoin || []).push(runSignature(run)); scheduleAutosave(); }
@@ -2093,7 +2137,7 @@ function cycleWeapon() {
   pickWeapon(next.id); toast(next.name);
 }
 async function removeWeapon(w) {
-  const go = await ask('Remove "'+w.name+'" from the list? Animations using it go back to the base hammer.', [['Cancel', false], ['Remove', true]]);
+  const go = await ask('Remove "'+w.name+'" from the list? Animations using it go back to the base hammer.', [['Cancel', false], ['Remove', true]], undefined, EXPLAIN.removeWeapon);
   if (!go) return;
   App.weapons = App.weapons.filter(o => o !== w);
   const g = weaponGfx.get(w.id);
@@ -2113,6 +2157,7 @@ function renderWeapons() {
       row.append(x);
     }
     row.addEventListener('click', () => { if (armed && w !== current) pickWeapon(w.id); });
+    row.addEventListener('contextmenu', e => { e.preventDefault(); weaponMenu(e.clientX, e.clientY, w); });
     box.append(row);
   }
   $('weaponSetup').hidden = !armed;
@@ -2167,6 +2212,12 @@ function setAutoBody(a, on) {
   endGesture(); refreshAll();
 }
 
+function flipRow(a) {
+  const wrap = el('div');
+  wrap.append(switchRow('Flip animation', () => !!a.flipped, () => { edit(() => { flipAnimation(a); }); App.selKeys.clear(); endGesture(); refreshAll(); }));
+  wrap.append(el('p', 'hint', a.type === 'weapon' ? 'Mirrors the motion left to right while the weapon stays in the same hand, so a forehand swing becomes a backhand.' : 'Mirrors the motion left to right, keeping each arm on its own side.'));
+  return wrap;
+}
 function connectedRow(a) {
   const wrap = el('div');
   wrap.append(switchRow('Connected bones', () => a.connected !== false, v => setConnected(a, v)));
@@ -2206,6 +2257,7 @@ function renderProps() {
       seg.append(b);
     }
     head.append(el('div','field'), seg);
+    head.append(flipRow(a));
     head.append(switchRow('Mirror to other hand', () => isMirrored(a), v => { edit(() => { setMirrored(a, v); }); App.selKeys.clear(); endGesture(); refreshAll(); }));
     head.append(el('p', 'hint', !isMirrored(a) ? 'Each hand has its own animation.' : a.otherHand ? 'Both hands share this animation. Your separate left-hand animation is saved: turn this off to get it back.' : 'Both hands share this animation, flipped.'));
     if (carrierOf(a) === armOf(a)) {
@@ -2239,7 +2291,7 @@ function renderProps() {
       for (const [k, label] of opts) { const l = el('label', 'check'), b = el('input'); b.type = 'checkbox'; b.checked = g[k]; b.addEventListener('change', () => set(k, b.checked)); l.append(b, label); grav.append(l); }
     }
     grav.append(el('p', 'hint', 'Drag a limb in the view to pose it, or use the sliders. Each change keys that part at the playhead.'));
-    grav.append(connectedRow(a));
+    grav.append(flipRow(a), connectedRow(a));
     box.append(grav);
     for (const p of BODY_PARTS) box.append(partSection(p, PART_LABEL[p], ORDER_OTHER, true));
   }
@@ -2300,18 +2352,36 @@ function animRow(a, i) {
       row.append(x);
     }
     row.addEventListener('click', () => { App.active = i; App.time = 0; App.selKeys.clear(); refreshAll(); });
+    row.addEventListener('contextmenu', e => { e.preventDefault(); animMenu(e.clientX, e.clientY, i); });
     return row;
 }
 
 const PART_LINE = { body:'#ef8a62', head:'#ffd166', right_arm:'#6fd3ff', left_arm:'#b79cff', right_leg:'#7fe08a', left_leg:'#f28fc0', root:'#c9d1dc' };
 
+const EYE_OPEN = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 8s2.6-4.8 7-4.8S15 8 15 8s-2.6 4.8-7 4.8S1 8 1 8z" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2.1" fill="currentColor"/></svg>';
+const EYE_SHUT = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 8s2.6-4.8 7-4.8S15 8 15 8s-2.6 4.8-7 4.8S1 8 1 8z" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M2.5 13.5l11-11" stroke="currentColor" stroke-width="1.6"/></svg>';
+// Hiding is only for looking: a hidden piece is still animated and exported.
+function togglePiece(p) {
+  if (App.view.off[p]) delete App.view.off[p]; else App.view.off[p] = true;
+  saveView(); renderOutliner();
+}
+function eyeButton(p) {
+  const hidden = !!App.view.off[p], b = el('button', 'eye'+(hidden ? ' shut' : ''));
+  b.innerHTML = hidden ? EYE_SHUT : EYE_OPEN;
+  b.title = (hidden ? 'Show ' : 'Hide ')+PART_LABEL[p]+' in the view';
+  b.setAttribute('aria-label', b.title); b.setAttribute('aria-pressed', String(hidden));
+  b.addEventListener('click', e => { e.stopPropagation(); togglePiece(p); });
+  return b;
+}
 function renderOutliner() {
   const box = $('outliner'); box.textContent = '';
   const puppet = anim().type === 'puppet';
   for (const p of workParts()) {
-    const row = el('div', 'item'+(p === App.sel ? ' on' : ''));
+    const row = el('div', 'item'+(p === App.sel ? ' on' : '')+(App.view.off[p] ? ' hiddenPiece' : ''));
     row.append(el('span', 'grow', PART_LABEL[p]));
     row.addEventListener('click', () => selectPart(p));
+    row.addEventListener('contextmenu', e => { e.preventDefault(); pieceMenu(e.clientX, e.clientY, p); });
+    if (p !== 'root') row.append(eyeButton(p));
     if (puppet) {
       const shown = !App.view.hidden[p], dot = el('button', 'lineDot');
       dot.style.borderColor = PART_LINE[p];
@@ -2387,15 +2457,16 @@ function hitBox(ray, m, b) {
   return t0 <= t1 && t1 > 0 ? Math.max(t0, 0) : null;
 }
 
-function pick(x, y) {
+function pick(x, y, any) {
   if (!world) return null;
-  const a = anim(), ray = rayAt(x, y), allowed = workParts();
+  const a = anim(), ray = rayAt(x, y), allowed = any ? PART_ORDER : workParts();
   let best = null, bestT = Infinity;
-  for (const part in partBounds) if (allowed.includes(part)) for (const b of partBounds[part]) {
+  for (const part in partBounds) if (allowed.includes(part) && !App.view.off[part]) for (const b of partBounds[part]) {
     const t = hitBox(ray, world[part], b);
     if (t !== null && t < bestT) { bestT = t; best = part; }
   }
   if (!bodyOnly()) for (const item of itemParts(a)) {
+    if (App.view.off[item]) continue;
     const w = weaponFor(a, item), base = M4.mul(world[item], itemMatrix(w, rig(), item));
     for (const b of (weaponGfx.get(w.id) || { pick:[] }).pick) {
       const t = hitBox(ray, M4.mul(base, b.m), b);
@@ -2437,14 +2508,17 @@ function segDist(px, py, a, b) {
   return Math.hypot(px-a[0]-dx*t, py-a[1]-dy*t);
 }
 
+// Which way is toward the camera from a point (for telling the near half of a ring from the far half).
+const towardViewer = c => V.norm(App.cam.ortho ? V.sub(camEye(), App.cam.target) : V.sub(camEye(), c));
 function gizmoHit(x, y) {
   if (!world || App.tool === 'pose' || !workParts().includes(App.sel)) return null;
   const c = gizmoCenter(App.sel), r = gizmoRadius();
   let best = null, bestD = 8;
+  const toward = towardViewer(c);
   if (App.tool === 'rotate') for (const g of rotateAxes(App.sel)) {
     const pts = ringPoints(c, g.axis, r);
     for (let i = 0; i < pts.length-1; i++) {
-      const d = segDist(x, y, toScreen(pts[i]), toScreen(pts[i+1]));
+      const d = segDist(x, y, toScreen(pts[i]), toScreen(pts[i+1]))+(V.dot(V.sub(pts[i], c), toward) < 0 ? 4 : 0);
       if (d < bestD) { bestD = d; best = { kind:'rotate', g, point:pts[i], center:c }; }
     }
   } else for (const g of moveAxes(App.sel)) {
@@ -2576,7 +2650,7 @@ function watchFlips(watch) {
 async function askFlipPath(watch) {
   const asked = new Set([...watch.found, ...changedArcs(watch)]);
   if (!asked.size) return;
-  const way = await ask(watch.found.size ? 'This rotation went past the half-turn point. How should it move between these keyframes?' : 'The arc between these keyframes changed a lot. Which way should it go?', [['Longest path', 'circle'], ['Shortest path', 'short']]);
+  const way = await ask(watch.found.size ? 'This rotation went past the half-turn point. How should it move between these keyframes?' : 'The arc between these keyframes changed a lot. Which way should it go?', [['Longest path', 'circle'], ['Shortest path', 'short']], undefined, EXPLAIN.path);
   if (!way) return;
   for (const k of asked) k.arc = way;
   invalidateCaches(); scheduleAutosave(); syncProps();
@@ -2587,7 +2661,7 @@ glc.addEventListener('contextmenu', e => e.preventDefault());
 glc.addEventListener('pointerdown', e => {
   glc.setPointerCapture(e.pointerId);
   const x = e.offsetX, y = e.offsetY;
-  if (e.button === 2) { drag = { kind:'pan', x, y }; return; }
+  if (e.button === 2) { drag = { kind:'pan', x, y, sx:x, sy:y, moved:false }; return; }
   if (e.button === 1) { drag = { kind:'orbit', x, y }; return; }
   const ph = pathHit(x, y);
   if (ph && ph.node) {
@@ -2630,7 +2704,7 @@ glc.addEventListener('pointerdown', e => {
     if (hit.part !== App.sel) selectPart(hit.part);
     if (App.tool === 'pose') {
       const c = gizmoCenter(hit.part), r = V.len(V.sub(hit.point, c));
-      drag = { kind:'trackball', part:hit.part, center:c, radius:Math.max(r, 2), last:V.norm(V.sub(hit.point, c)), watch:flipWatch([hit.part]) };
+      drag = { kind:'trackball', part:hit.part, center:c, radius:Math.max(r, 2), last:V.norm(V.sub(hit.point, c)), watch:flipWatch([hit.part]), local:M4.pt(M4.invert(world[hit.part]), hit.point) };
     }
     return;
   }
@@ -2652,6 +2726,7 @@ glc.addEventListener('pointermove', e => {
   if (drag.kind === 'orbit') {
     const c = App.cam; c.yaw -= (x-drag.x)*.008; c.pitch = clamp(c.pitch+(y-drag.y)*.008, -1.55, 1.55); drag.x = x; drag.y = y;
   } else if (drag.kind === 'pan') {
+    if (Math.hypot(x-drag.sx, y-drag.sy) > 4) drag.moved = true;
     const c = App.cam, inv = M4.invert(M4.lookAt(camEye(), c.target, [0,1,0]));
     const s = c.dist*.0016, right = M4.dir(inv,[1,0,0]), up = M4.dir(inv,[0,1,0]);
     c.target = V.add(c.target, V.add(V.scale(right, -(x-drag.x)*s), V.scale(up, (y-drag.y)*s))); drag.x = x; drag.y = y;
@@ -2689,7 +2764,11 @@ glc.addEventListener('pointermove', e => {
     syncProps();
   }
 });
-glc.addEventListener('pointerup', () => { const watch = drag && drag.watch; drag = null; if (watch) askFlipPath(watch); });
+glc.addEventListener('pointerup', e => {
+  const was = drag; drag = null;
+  if (was && was.kind === 'pan' && !was.moved) { viewMenu(e.clientX, e.clientY, e.offsetX, e.offsetY); return; }
+  if (was && was.watch) askFlipPath(was.watch);
+});
 glc.addEventListener('dblclick', e => {
   const ph = pathHit(e.offsetX, e.offsetY);
   if (!ph || !ph.seg || !ph.seg.mid) return;
@@ -2711,6 +2790,7 @@ function onionTime(a) {
 }
 function drawWeapons(a, r, w, tintOf, alpha) {
   for (const item of itemParts(a)) {
+    if (App.view.off[item]) continue;
     const wp = weaponFor(a, item), M = M4.mul(w[item], itemMatrix(wp, r, item));
     for (const b of (weaponGfx.get(wp.id) || { batches:[] }).batches) R.draw(b, M, tintOf(item), alpha);
   }
@@ -2721,7 +2801,7 @@ function drawOnion(a, r) {
   if (t === null) return;
   const w = computeWorld(poseAt(a, t, r), r), tintOf = () => GHOST_TINT;
   R.ghost(alpha => {
-    for (const part in playerBatches) for (const b of playerBatches[part]) if (!b.outer || App.showOuter) R.draw(b, w[part], GHOST_TINT, alpha);
+    for (const part in playerBatches) if (!App.view.off[part]) for (const b of playerBatches[part]) if (!b.outer || App.showOuter) R.draw(b, w[part], GHOST_TINT, alpha);
     drawWeapons(a, r, w, tintOf, alpha);
   }, GHOST_ALPHA);
 }
@@ -2742,12 +2822,13 @@ function draw() {
   const pose = poseAt(a, App.time, r);
   world = computeWorld(pose, r);
   for (const part in playerBatches) {
+    if (App.view.off[part]) continue;
     const tint = tintFor(part);
     for (const b of playerBatches[part]) if (!b.outer || App.showOuter) R.draw(b, world[part], tint);
   }
   drawWeapons(a, r, world, tintFor);
   drawOnion(a, r);
-  if (App.view.highlight && partBounds[App.sel]) for (const b of partBounds[App.sel]) R.outline(b.min, b.max, world[App.sel], [...App.theme.gl, .9]);
+  if (App.view.highlight && partBounds[App.sel] && !App.view.off[App.sel]) for (const b of partBounds[App.sel]) R.outline(b.min, b.max, world[App.sel], [...App.theme.gl, .9]);
   drawOverlay(a, r, dpr);
   drawTimeline();
 }
@@ -2798,18 +2879,46 @@ function drawOverlay(a, r, dpr) {
   }
   if (pathsOn()) drawPaths();
   if (App.view.paths && a.type === 'puppet') drawBodyPaths(a, r);
+  if (drag && drag.kind === 'trackball' && world[drag.part]) {
+    // Exactly where the piece is being held, with a thin line back to the joint it turns around.
+    const s = toScreen(M4.pt(world[drag.part], drag.local)), o = toScreen(gizmoCenter(drag.part));
+    ov.strokeStyle = 'rgba(242,244,247,.55)'; ov.lineWidth = 1.5; ov.setLineDash([3, 3]);
+    ov.beginPath(); ov.moveTo(o[0], o[1]); ov.lineTo(s[0], s[1]); ov.stroke(); ov.setLineDash([]);
+    ov.fillStyle = App.theme.accent; ov.strokeStyle = '#f2f4f7'; ov.lineWidth = 2;
+    ov.beginPath(); ov.arc(s[0], s[1], 6, 0, 7); ov.fill(); ov.stroke();
+  }
   if (App.tool === 'pose' || !workParts().includes(App.sel)) return;
   const c = gizmoCenter(App.sel), rad = gizmoRadius();
   ov.lineWidth = 2.5;
-  if (App.tool === 'rotate') for (const g of rotateAxes(App.sel)) {
-    const pts = ringPoints(c, g.axis, rad);
-    ov.strokeStyle = g.color; ov.beginPath();
-    pts.forEach((p, i) => { const s = toScreen(p); i ? ov.lineTo(s[0], s[1]) : ov.moveTo(s[0], s[1]); });
-    ov.stroke();
-  } else for (const g of moveAxes(App.sel)) {
+  if (App.tool === 'rotate') drawRings(c, rad);
+  else for (const g of moveAxes(App.sel)) {
     const a0 = toScreen(c), b0 = toScreen(V.add(c, V.scale(g.axis, rad*1.2)));
     ov.strokeStyle = ov.fillStyle = g.color; ov.beginPath(); ov.moveTo(a0[0], a0[1]); ov.lineTo(b0[0], b0[1]); ov.stroke();
     ov.beginPath(); ov.arc(b0[0], b0[1], 5, 0, 7); ov.fill();
+  }
+}
+
+// Rotate rings with depth: the half of each ring facing you is bold, the far half faint and dashed, and an
+// arrowhead sits on the nearest point of each ring, drawn in 3D so its tilt shows how the ring leans.
+function drawRings(c, rad) {
+  const toward = towardViewer(c), rings = rotateAxes(App.sel).map(g => ({ g, pts:ringPoints(c, g.axis, rad) }));
+  const near = p => V.dot(V.sub(p, c), toward);
+  for (const front of [false, true]) for (const { g, pts } of rings) {
+    ov.strokeStyle = g.color; ov.globalAlpha = front ? 1 : .32; ov.lineWidth = front ? 3 : 1.5; ov.setLineDash(front ? [] : [4, 4]);
+    ov.beginPath();
+    for (let i = 0; i < pts.length-1; i++) {
+      if ((near(V.scale(V.add(pts[i], pts[i+1]), .5)) >= 0) !== front) continue;
+      const a = toScreen(pts[i]), b = toScreen(pts[i+1]);
+      ov.moveTo(a[0], a[1]); ov.lineTo(b[0], b[1]);
+    }
+    ov.stroke();
+  }
+  ov.setLineDash([]); ov.globalAlpha = 1;
+  for (const { g, pts } of rings) {
+    const p = pts.reduce((a, b) => near(b) > near(a) ? b : a), out = V.norm(V.sub(p, c)), along = V.norm(V.cross(g.axis, out));
+    const tip = toScreen(V.add(p, V.scale(along, rad*.2))), l = toScreen(V.sub(V.add(p, V.scale(out, rad*.09)), V.scale(along, rad*.08))), r = toScreen(V.sub(V.sub(p, V.scale(out, rad*.09)), V.scale(along, rad*.08)));
+    ov.fillStyle = g.color; ov.strokeStyle = '#0d0f12'; ov.lineWidth = 1;
+    ov.beginPath(); ov.moveTo(tip[0], tip[1]); ov.lineTo(l[0], l[1]); ov.lineTo(r[0], r[1]); ov.closePath(); ov.fill(); ov.stroke();
   }
 }
 
@@ -2834,6 +2943,8 @@ function tlPps(w) { return tlView.pps || Math.max(1, tlFitPps(w)); }
 const tToX = (t, pps) => LABEL_W+8+t*pps-tlView.scrollX;
 const xToT = (x, pps) => (x-LABEL_W-8+tlView.scrollX)/pps;
 const nearLimiter = (x, pps) => x > LABEL_W && Math.abs(x-tToX(anim().length, pps)) < 7;
+// When the playhead sits on the limiter, the top half of the ruler grabs the playhead and the rest grabs the limiter.
+const grabsLimiter = (x, y, pps) => nearLimiter(x, pps) && !(y < RULER_H/2 && Math.abs(x-tToX(App.time, pps)) < 7) && (y < RULER_H || !(keyUnder(x, y) || {}).key);
 function clampScrollX(w, pps) { tlView.scrollX = clamp(tlView.scrollX, 0, Math.max(0, LABEL_W+24+tlSpan()*pps-w)); }
 
 function drawTimeline() {
@@ -2866,7 +2977,7 @@ function drawTimeline() {
     tl.fillRect(0, y, w, ROW_H);
     tl.fillStyle = part === App.sel ? App.theme.pale : '#d9dde4';
     tl.textAlign = 'left';
-    tl.fillText(partTitle(part), 12, y+ROW_H/2);
+    tl.fillText(partTitle(part)+(App.view.off[part] ? ' (hidden)' : ''), 12, y+ROW_H/2);
     tl.save(); tl.beginPath(); tl.rect(LABEL_W, 0, w-LABEL_W, h); tl.clip();
     const rowHeld = (a.tracks[part]||[]).some(k => k.hold);
     if (rowHeld) { tl.fillStyle = App.theme.faint; tl.fillRect(tToX(0, pps), y+3, a.length*pps, ROW_H-6); }
@@ -2892,7 +3003,7 @@ function drawTimeline() {
   const endX = tToX(a.length, pps);
   tl.fillStyle = 'rgba(10,12,16,.5)'; tl.fillRect(endX, 0, w, h);
   tl.fillStyle = '#a9c7e6'; tl.fillRect(endX, 0, 1.5, h);
-  tl.beginPath(); tl.moveTo(endX-5, 0); tl.lineTo(endX+6, 0); tl.lineTo(endX+.75, 8); tl.closePath(); tl.fill();
+  tl.beginPath(); tl.moveTo(endX-5, RULER_H); tl.lineTo(endX+6, RULER_H); tl.lineTo(endX+.75, RULER_H-9); tl.closePath(); tl.fill();
   tl.font = '10px "Segoe UI", sans-serif'; tl.fillText(a.loop ? 'LOOP' : a.hold ? 'HOLD' : 'STOP', endX+6, 18);
   const px = tToX(App.time, pps); tl.fillStyle = App.theme.accent; tl.fillRect(px,0,1.5,h);
   tl.beginPath(); tl.moveTo(px-5,0); tl.lineTo(px+6,0); tl.lineTo(px+.75,8); tl.closePath(); tl.fill();
@@ -2909,9 +3020,10 @@ function keyUnder(x, y) {
 }
 
 tlc.addEventListener('pointerdown', e => {
+  if (e.button === 2) { tlMenu(e); return; }
   tlc.setPointerCapture(e.pointerId);
   const x = e.offsetX, y = e.offsetY, pps = tlPps(tlc.clientWidth);
-  if (nearLimiter(x, pps) && (y < RULER_H || !(keyUnder(x, y) || {}).key)) { tlView.span = tlSpan(); tlDrag = { kind:'limit' }; return; }
+  if (grabsLimiter(x, y, pps)) { tlView.span = tlSpan(); tlDrag = { kind:'limit' }; return; }
   if (y < RULER_H && x > LABEL_W) { tlDrag = { kind:'scrub' }; setTime(exactT(xToT(x, pps))); return; }
   const hit = keyUnder(x, y);
   if (!hit) { App.selKeys.clear(); return; }
@@ -2929,7 +3041,7 @@ tlc.addEventListener('pointerdown', e => {
 });
 tlc.addEventListener('pointermove', e => {
   const x = e.offsetX, y = e.offsetY, pps = tlPps(tlc.clientWidth), a = anim();
-  if (!tlDrag) { tlc.style.cursor = nearLimiter(x, pps) && (y < RULER_H || !(keyUnder(x, y) || {}).key) ? 'ew-resize' : 'default'; return; }
+  if (!tlDrag) { tlc.style.cursor = grabsLimiter(x, y, pps) ? 'ew-resize' : 'default'; return; }
   if (tlDrag.kind === 'limit') {
     const len = clamp(snapT(xToT(x, pps)), .05, 60), w = tlc.clientWidth;
     edit(() => { a.length = len; });
@@ -3051,7 +3163,7 @@ const readData = f => new Promise((ok, no) => { const r = new FileReader(); r.on
 // One prompt at a time. Pressing Esc gives undefined, which every caller treats as "leave it as it is".
 // Giving it an initial value adds a text box; the ASK_TEXT button answers with what was typed.
 const ASK_TEXT = {};
-function ask(text, options, initial) {
+function ask(text, options, initial, more) {
   const show = () => new Promise(ok => {
     const d = $('askDlg'), box = $('askButtons'), input = $('askInput');
     const done = value => { d.oncancel = d.onclose = input.onkeydown = null; if (d.open) d.close(); ok(value === ASK_TEXT ? input.value.trim() : value); };
@@ -3059,6 +3171,13 @@ function ask(text, options, initial) {
     input.value = initial || '';
     input.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); done(ASK_TEXT); } };
     $('askText').textContent = text; box.textContent = '';
+    const extra = $('askMore');
+    extra.hidden = true; extra.textContent = more || '';
+    if (more) {
+      const b = el('button', 'askMoreBtn', 'Elaborate');
+      b.addEventListener('click', () => { extra.hidden = !extra.hidden; b.textContent = extra.hidden ? 'Elaborate' : 'Less'; });
+      box.append(b);
+    }
     options.forEach(([label, value]) => { const b = el('button', '', label); b.addEventListener('click', () => done(value)); box.append(b); });
     d.oncancel = e => { e.preventDefault(); done(); };
     // If the browser closes it some other way. A late close event from the last prompt finds this one open and is ignored.
@@ -3068,6 +3187,237 @@ function ask(text, options, initial) {
   });
   return ask.queue = (ask.queue || Promise.resolve()).then(show);
 }
+// ---- Right-click menus: a short list of what you can do to the thing under the pointer, with Elaborate first. ----
+
+const EXPLAIN = {
+  join: 'With Auto tween on, every keyframe is a point the swing must reach at an exact moment, so the motion eases toward each one and slows a little there. When three or more keys lie along one smooth curve, those slowdowns make a single swing look like several jerky pieces.\n\nJoin into one arc: the curve keeps its shape (the keys in between become shape points), but their timing goes, so the weapon sweeps at an even speed from the first key to the last.\n\nKeep separate: every key stays its own timed point. Choose this if you want the swing to pause or change speed at those keys.\n\nEither way, Ctrl+Z undoes it.',
+  path: 'A rotation can get from one pose to the next by turning either way round.\n\nShortest path turns the smaller amount, which is usually what you want.\n\nLongest path goes the long way round, for example a full circle over the head instead of a small flick back.\n\nYou are asked because your last drag changed this part of the swing a lot. You can change it later by right-clicking the keyframe circle on the path.',
+  removeWeapon: 'Removing takes the model out of the Weapons list. Animations that were using it switch to the base hammer, and their motion is not changed. Re-import the model if you want it back.',
+  image: 'This picture is 64×64, the size of a Minecraft skin, so it could be either.\n\nPlayer skin puts it on the player.\n\nWeapon texture applies it to the selected weapon model instead.',
+  newProject: 'A new project replaces all of your animations and export groups with the starting Hammer Swing. Your skin and every imported weapon stay. Save first (Ctrl+S) if you want to keep the current animations.',
+  view: 'Empty space in the view.\n\nShow all pieces brings back anything you have hidden.\nOnion skin shows the pose at the previous keyframe as a see-through blue figure, to compare against.\nTrajectory lines draw the path of the hand and weapon tip (and of every body part in puppet animations).\nHighlighting tints and outlines the selected piece.\nFront, Side and Top line the camera up straight.\n\nRight-drag pans, dragging empty space orbits, and the wheel zooms.',
+  ruler: 'The ruler shows time in seconds.\n\nThe orange marker is the playhead: the moment you are looking at and keying.\nThe blue line is the length limiter: the animation ends there, and anything past it is kept but not played or exported.\nWhen both are in the same spot, the top half of the ruler grabs the playhead and the bottom half grabs the limiter.\n\nEnd decides what happens at the limiter: Stop, Hold last frame (written into the exports too), or Loop.',
+  keys: 'A keyframe pins a piece\'s position and rotation at one moment. Between keyframes the motion is filled in.\n\nTween sets how it travels from this keyframe to the next one:\n• Smooth eases through the neighbouring keys.\n• Linear moves at an even speed.\n• Bezier follows the curve you shape in the curve panel, which opens while a Bezier key is selected.\n• Step jumps straight to the next keyframe with no motion between.\nWith Auto tween on, the weapon arm and weapon move in clean arcs instead, so only Smooth and Bezier apply.\n\nConstant holds this piece at this keyframe for the whole animation. Its other keys are kept, just ignored until you turn it off.\n\nCopy curve and Paste curve carry a Bezier curve\'s four numbers to other keys (they become Bezier keys). Ctrl+Shift+C and Ctrl+Shift+V do the same.\n\nCopy and Paste duplicate keys at the playhead, keeping their spacing. Delete removes them. Ctrl+Z undoes any of these.',
+  node: 'This circle is a keyframe on the swing\'s path: orange follows the hand, blue the weapon tip. Drag it to move that keyframe\'s pose directly.\n\nGo to this keyframe moves the playhead there.\nShortest path and Longest path choose which way round the rotation goes on its way to the next keyframe: the short turn, or the long way round (for example a full circle overhead).\nDelete this keyframe removes the arm and weapon keys at that moment.',
+  bend: 'This square bends the arc between two keyframes at its halfway point, without adding a keyframe. Drag it to curve the swing. Reset bend straightens it again (double-clicking the square does the same).',
+  anim: 'Weapon animations move a held weapon, with optional Auto body and Auto tween. Puppet animations pose the whole body directly, with optional gravity.\n\nRename changes its name, which is also its name in exports.\nCopy animation and Paste animation here move a whole animation, keys and settings, even into another project.\nDuplicate makes a copy, to try a variation without losing the original.\nDelete removes it (Ctrl+Z undoes).\n\nThe Export group dropdown, at the top right, decides which file it goes into when exporting by group.',
+  weapon: 'The Weapons list holds every model you have imported, plus the base hammer.\n\nUse in this animation swaps the weapon shown, which also sets where the weapon tip and its arcs are. Q cycles through the list.\nUse as off-hand gives the other hand this weapon, for dual wielding.\nReplace texture loads a new PNG for this model.\nRemove takes it out of the list; animations using it go back to the base hammer.\n\nThe model is only a preview: exports hold the motion, except .bbmodel, which includes it.',
+};
+function explainPiece(part) {
+  const a = anim(), name = partTitle(part), lines = [];
+  if (part === 'weapon' || part === 'offhand') lines.push(name+' is a held weapon. Its keys are relative to the bone carrying it ('+PART_LABEL[part === 'weapon' ? carrierOf(a) : offCarrierOf(a)]+'), so it moves with that bone and only needs keys for its own turn in the grip. The model is only a preview: exports hold the motion.');
+  else if (part === 'root') lines.push('Whole Body moves the entire player at once. Key it upward to jump, or turn it to face another way.');
+  else if (a.type === 'weapon' && part === carrierOf(a)) lines.push(name+' carries the weapon.'+(autoTweenOn(a) ? ' With Auto tween on, its keys and the weapon\'s keys make one clean arc, drawn as the orange (hand) and blue (tip) lines.' : ''));
+  else lines.push(name+' is one bone of the player. '+(a.connected !== false && ['head', 'right_arm', 'left_arm'].includes(part) ? 'Connected bones is on, so it also moves when the body moves.' : 'It moves on its own.'));
+  if (!workParts().includes(part)) lines.push('Auto body is on, so it keys this piece for you whenever you edit a weapon keyframe. Turn Auto body off to key it by hand.');
+  lines.push('', 'Select makes it the piece the sliders and the Rotate and Move tools work on.', 'Key this piece here records its current pose at the playhead.', 'Reset to rest pose here keys it back to its starting pose at the playhead.');
+  if (part !== 'root') lines.push('Hide this piece takes it out of the view so you can see past it. It is still animated and exported. Bring it back here, with its eye in Parts, or by right-clicking empty space.');
+  if (part === 'weapon' && a.type === 'weapon') lines.push('Next weapon swaps in the next model from the Weapons list (same as Q).');
+  return lines.join('\n');
+}
+
+function closeMenu() { const m = $('ctxMenu'); if (m) m.remove(); }
+// items: { label, act, check?, disabled?, title? }, '-' for a divider, a plain string for a small heading, or null to skip.
+function openMenu(cx, cy, explain, items) {
+  closeMenu();
+  const m = el('div', 'ctxMenu'); m.id = 'ctxMenu'; m.setAttribute('role', 'menu');
+  const add = (label, act, o = {}) => {
+    const b = el('button', o.cls || '', label);
+    b.setAttribute('role', 'check' in o ? 'menuitemcheckbox' : 'menuitem');
+    if ('check' in o) b.setAttribute('aria-checked', String(!!o.check));
+    if (o.disabled) b.disabled = true;
+    if (o.title) b.title = o.title;
+    b.addEventListener('click', () => { closeMenu(); act(); });
+    m.append(b);
+  };
+  add('Elaborate', () => ask(explain, [['Got it', true]]), { cls:'elab', title:'What this is, and what each option here does' });
+  m.append(el('hr'));
+  for (const it of items) {
+    if (!it) continue;
+    if (it === '-') m.append(el('hr'));
+    else if (typeof it === 'string') m.append(el('div', 'label', it));
+    else add(it.label, it.act, it);
+  }
+  document.body.append(m);
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(4, Math.min(cx, innerWidth-r.width-6))+'px';
+  m.style.top = Math.max(4, Math.min(cy, innerHeight-r.height-6))+'px';
+  m.querySelector('button').focus();
+}
+window.addEventListener('pointerdown', e => { const m = $('ctxMenu'); if (m && !m.contains(e.target)) closeMenu(); }, true);
+window.addEventListener('blur', closeMenu);
+window.addEventListener('resize', closeMenu);
+// The browser's own right-click menu has nothing useful here, except in text boxes.
+document.addEventListener('contextmenu', e => { if (!e.target.matches('input, textarea')) e.preventDefault(); });
+function menuKey(e) {
+  const m = $('ctxMenu');
+  if (!m) return false;
+  const list = [...m.querySelectorAll('button:not(:disabled)')], i = list.indexOf(document.activeElement);
+  if (e.key === 'Escape') closeMenu();
+  else if (e.key === 'ArrowDown') list[(i+1)%list.length].focus();
+  else if (e.key === 'ArrowUp') list[(i-1+list.length)%list.length].focus();
+  else if ((e.key === 'Enter' || e.key === ' ') && m.contains(document.activeElement)) document.activeElement.click();
+  else if (e.key !== 'Tab') return true;
+  else return false;
+  e.preventDefault();
+  return true;
+}
+
+function setViewFlag(key, on) {
+  App.view[key] = on;
+  const box = { paths:'showPaths', highlight:'showHighlight', onion:'showOnion' }[key];
+  if (box) $(box).checked = on;
+  saveView();
+}
+function pieceMenu(cx, cy, part) {
+  const keyable = workParts().includes(part), a = anim();
+  openMenu(cx, cy, explainPiece(part), [
+    { label:'Select', act:() => selectPart(part), disabled:!keyable },
+    { label:'Key this piece here', act:() => { selectPart(part); addKey(); }, disabled:!keyable },
+    { label:'Reset to rest pose here', act:() => { edit(() => { const k = ensureKey(part); k.p = [0,0,0]; k.r = [0,0,0]; }); endGesture(); syncProps(); }, disabled:!keyable },
+    part === 'weapon' && a.type === 'weapon' ? { label:'Next weapon (Q)', act:cycleWeapon } : null,
+    part === 'root' ? null : '-',
+    part === 'root' ? null : { label:App.view.off[part] ? 'Show this piece' : 'Hide this piece', act:() => togglePiece(part) },
+  ]);
+}
+function viewMenu(cx, cy, x, y) {
+  const ph = pathHit(x, y);
+  if (ph) { (ph.node ? nodeMenu : bendMenu)(cx, cy, ph); return; }
+  const hit = pick(x, y, true);
+  if (hit) { pieceMenu(cx, cy, hit.part); return; }
+  openMenu(cx, cy, EXPLAIN.view, [
+    { label:'Show all pieces', act:() => { App.view.off = {}; saveView(); renderOutliner(); }, disabled:!Object.keys(App.view.off).length },
+    '-',
+    { label:'Onion skin', check:App.view.onion, act:() => setViewFlag('onion', !App.view.onion) },
+    { label:'Trajectory lines', check:App.view.paths, act:() => setViewFlag('paths', !App.view.paths) },
+    { label:'Highlighting', check:App.view.highlight, act:() => setViewFlag('highlight', !App.view.highlight) },
+    '-',
+    { label:'Front view', act:() => setView('front') },
+    { label:'Side view', act:() => setView('side') },
+    { label:'Top view', act:() => setView('top') },
+  ]);
+}
+const keysAt = (t, parts) => parts.map(p => (anim().tracks[p] || []).find(k => Math.abs(k.t-t) < 1e-3)).filter(Boolean);
+function nodeMenu(cx, cy, ph) {
+  const t = ph.node.t, keys = keysAt(t, [ph.pair.carrier, ph.pair.weapon]), arc = (keys.find(k => k.arc) || {}).arc;
+  const later = [ph.pair.carrier, ph.pair.weapon].some(p => (anim().tracks[p] || []).some(k => k.t > t+1e-3));
+  const setArc = way => { edit(() => { for (const k of keys) k.arc = way; }); endGesture(); };
+  openMenu(cx, cy, EXPLAIN.node, [
+    { label:'Go to this keyframe', act:() => setTime(t) },
+    '-', 'Path to the next keyframe',
+    { label:'Shortest path', check:arc !== 'circle', act:() => setArc('short'), disabled:!later || !keys.length },
+    { label:'Longest path', check:arc === 'circle', act:() => setArc('circle'), disabled:!later || !keys.length },
+    '-',
+    { label:'Delete this keyframe', act:() => { App.selKeys = new Set(keys); deleteKeys(); }, disabled:!keys.length },
+  ]);
+}
+function bendMenu(cx, cy, ph) {
+  const reset = which => { edit(() => { const k = pathKey(ph.seg.t, ph.pair.carrier); if (!k.mid) return; for (const w of which) k.mid[w] = [0,0,0]; if (k.mid.base.every(v => !v) && k.mid.tip.every(v => !v)) delete k.mid; }); endGesture(); };
+  const bent = w => !!(ph.seg.mid && ph.seg.mid[w].some(v => v));
+  openMenu(cx, cy, EXPLAIN.bend, [
+    { label:'Reset this bend', act:() => reset([ph.which]), disabled:!bent(ph.which) },
+    { label:'Reset both bends here', act:() => reset(['base', 'tip']), disabled:!bent('base') && !bent('tip') },
+  ]);
+}
+function setTween(keys, v) {
+  edit(() => { for (const k of keys) { k.i = v; if (v === 'bezier' && !k.bez) k.bez = BEZIER_DEFAULT.slice(); } });
+  endGesture();
+}
+function tlMenu(e) {
+  const x = e.offsetX, y = e.offsetY, pps = tlPps(tlc.clientWidth), cx = e.clientX, cy = e.clientY, a = anim();
+  if (y < RULER_H) {
+    if (x < LABEL_W) return;
+    const t = exactT(Math.max(0, xToT(x, pps))), end = a.loop ? 'loop' : a.hold ? 'hold' : 'stop';
+    const setEnd = v => { edit(() => { a.loop = v === 'loop'; a.hold = v === 'hold'; }); endGesture(); refreshAll(); };
+    openMenu(cx, cy, EXPLAIN.ruler, [
+      { label:'Move playhead here', act:() => setTime(t) },
+      { label:'End the animation here', act:() => { edit(() => { a.length = clamp(snapT(t), .05, 60); }); endGesture(); refreshAll(); } },
+      '-', 'At the end',
+      { label:'Stop', check:end === 'stop', act:() => setEnd('stop') },
+      { label:'Hold last frame', check:end === 'hold', act:() => setEnd('hold') },
+      { label:'Loop', check:end === 'loop', act:() => setEnd('loop') },
+    ]);
+    return;
+  }
+  const hit = keyUnder(x, y);
+  if (!hit) return;
+  if (x < LABEL_W) { pieceMenu(cx, cy, hit.part); return; }
+  if (hit.key) {
+    if (!App.selKeys.has(hit.key)) { App.selKeys.clear(); App.selKeys.add(hit.key); }
+    selectPart(hit.part);
+    const keys = [...App.selKeys], auto = autoTweenOn(a), cur = auto && keys[0].i !== 'bezier' ? 'smooth' : keys[0].i || 'smooth';
+    const tweens = [['smooth', 'Smooth'], ['linear', 'Linear'], ['bezier', 'Bezier'], ['step', 'Step']].filter(([v]) => !auto || v === 'smooth' || v === 'bezier');
+    openMenu(cx, cy, EXPLAIN.keys, [
+      'Tween to the next key',
+      ...tweens.map(([v, label]) => ({ label, check:cur === v, act:() => setTween(keys, v) })),
+      '-',
+      { label:'Copy curve', act:() => copyCurve(keys), disabled:!keys.some(k => k.i === 'bezier') },
+      { label:'Paste curve', act:() => pasteCurve(keys), disabled:!App.bezClip },
+      '-',
+      { label:'Constant (hold all animation)', check:keys.some(k => k.hold), act:toggleConstant },
+      '-',
+      { label:'Copy', act:copyKeys },
+      { label:'Paste at playhead', act:pasteKeys, disabled:!App.clip },
+      { label:'Move playhead here', act:() => setTime(hit.key.t) },
+      { label:keys.length > 1 ? 'Delete '+keys.length+' keys' : 'Delete', act:deleteKeys },
+    ]);
+    return;
+  }
+  const t = snapT(clamp(xToT(x, pps), 0, a.length));
+  openMenu(cx, cy, EXPLAIN.keys+'\n\nThis row holds every keyframe of '+partTitle(hit.part)+'. Add key here records its pose at that moment; Select all keys in this row lets you drag, copy or delete them together.', [
+    { label:'Add key here', act:() => { App.time = t; selectPart(hit.part); edit(() => { App.selKeys.clear(); App.selKeys.add(ensureKey(hit.part)); }); endGesture(); syncProps(); } },
+    { label:'Paste here', act:() => { App.time = t; pasteKeys(); syncProps(); }, disabled:!App.clip },
+    { label:'Select all keys in this row', act:() => { App.selKeys = new Set(a.tracks[hit.part] || []); selectPart(hit.part); }, disabled:!(a.tracks[hit.part] || []).length },
+    hit.part === 'root' ? null : '-',
+    hit.part === 'root' ? null : { label:App.view.off[hit.part] ? 'Show this piece' : 'Hide this piece', act:() => togglePiece(hit.part) },
+  ]);
+}
+// The animation clipboard is kept in this browser too, so a copy can be pasted into another project or window.
+function animClip() {
+  if (App.animClip) return App.animClip;
+  try { return localStorage.getItem('player-animator-anim-clip'); } catch (e) { return null; }
+}
+function copyAnimation(a) {
+  App.animClip = JSON.stringify(a);
+  try { localStorage.setItem('player-animator-anim-clip', App.animClip); } catch (e) { /* the in-app copy still works */ }
+  toast('Copied "'+a.name+'"');
+}
+function pasteAnimation(at) {
+  const text = animClip();
+  if (!text) { toast('Copy an animation first.'); return; }
+  let a;
+  try { a = normalizeAnim(JSON.parse(text)); } catch (e) { toast('That copy could not be read.'); return; }
+  a.name = uniqueName(a.name);
+  edit(() => {
+    if (a.group && !App.groups.includes(a.group)) App.groups.push(a.group);
+    App.anims.splice(at, 0, a); App.active = at;
+  });
+  endGesture(); App.time = 0; App.selKeys.clear(); refreshAll();
+  toast('Pasted "'+a.name+'"');
+}
+function animMenu(cx, cy, i) {
+  const a = App.anims[i];
+  openMenu(cx, cy, EXPLAIN.anim, [
+    { label:'Open', act:() => { App.active = i; App.time = 0; App.selKeys.clear(); refreshAll(); }, disabled:i === App.active },
+    { label:'Rename…', act:async () => { const name = await askName('Rename this animation:', a.name); if (name) { edit(() => { a.name = name; }); endGesture(); refreshAll(); } } },
+    { label:'Copy animation', act:() => copyAnimation(a) },
+    { label:'Paste animation here', act:() => pasteAnimation(i+1), disabled:!animClip() },
+    { label:'Duplicate', act:() => { edit(() => { const copy = JSON.parse(JSON.stringify(a)); copy.name = uniqueName(a.name+' copy'); App.anims.splice(i+1, 0, copy); App.active = i+1; }); endGesture(); App.time = 0; App.selKeys.clear(); refreshAll(); } },
+    '-',
+    { label:'Delete', act:() => { edit(() => { App.anims.splice(i, 1); App.active = clamp(App.active-(i < App.active ? 1 : 0), 0, App.anims.length-1); }); endGesture(); App.selKeys.clear(); refreshAll(); }, disabled:App.anims.length < 2 },
+  ]);
+}
+function weaponMenu(cx, cy, w) {
+  const a = anim(), armed = a.type === 'weapon';
+  openMenu(cx, cy, EXPLAIN.weapon, [
+    { label:'Use in this animation', act:() => pickWeapon(w.id), disabled:!armed || activeWeapon() === w },
+    { label:'Use as off-hand', act:() => { edit(() => { a.off = w.id; }); App.selKeys.clear(); endGesture(); refreshAll(); }, disabled:!armed },
+    '-',
+    { label:'Replace texture…', act:() => { App.texTarget = w; $('fileTex').click(); }, disabled:!!w.placeholder },
+    { label:'Remove', act:() => removeWeapon(w), disabled:!!w.placeholder },
+  ]);
+}
+
 const askName = (text, initial) => ask(text, [['Cancel', undefined], ['OK', ASK_TEXT]], initial || '').then(v => v || undefined);
 
 async function importSkin(file) {
@@ -3105,7 +3455,7 @@ async function importFiles(files) {
       const img = await loadImage(await readData(pngs[0]));
       const skinLike = img.width === 64 && (img.height === 64 || img.height === 32);
       const hasWeapon = App.weapons.length > 0;
-      const asSkin = skinLike && (!hasWeapon || await ask('Use this image as…', [['Player skin', true], ['Weapon texture', false]]));
+      const asSkin = skinLike && (!hasWeapon || await ask('Use this image as…', [['Player skin', true], ['Weapon texture', false]], undefined, EXPLAIN.image));
       if (asSkin === undefined) return;
       if (asSkin) await importSkin(pngs[0]);
       else await applyWeaponTexture(pngs[0]);
@@ -3298,7 +3648,7 @@ function uniqueName(base) { let n = base, i = 2; while (App.anims.some(a => a.na
 
 const actions = {
   // A new project starts the animations over; your skin and imported weapons stay.
-  'new': async () => { if (await ask('Start a new project? Your animations and groups will be replaced. Your skin and weapons stay.', [['Cancel', false], ['New project', true]])) { App.anims = [templateAnim()]; App.active = 0; App.groups = []; App.saveHandle = null; App.undo = []; App.redo = []; App.selKeys.clear(); App.time = 0; invalidateCaches(); refreshAll(); scheduleAutosave(); } },
+  'new': async () => { if (await ask('Start a new project? Your animations and groups will be replaced. Your skin and weapons stay.', [['Cancel', false], ['New project', true]], undefined, EXPLAIN.newProject)) { App.anims = [templateAnim()]; App.active = 0; App.groups = []; App.saveHandle = null; App.undo = []; App.redo = []; App.selKeys.clear(); App.time = 0; invalidateCaches(); refreshAll(); scheduleAutosave(); } },
   open: () => $('fileProject').click(), save: saveProject,
   'import-weapon': () => $('fileWeapon').click(), 'import-skin': () => $('fileSkin').click(),
   'weapon-texture': () => $('fileTex').click(),
@@ -3402,6 +3752,20 @@ function syncTweenUI() {
   $('bezPanel').hidden = !b;
   if (b) drawBez(b);
 }
+// Curve clipboard: one curve's four numbers, pasted onto any keys (they become Bezier keys).
+function copyCurve(keys = bezKeys()) {
+  const k = keys.find(o => o.i === 'bezier');
+  if (!k) { toast('Select a Bezier keyframe first.'); return; }
+  App.bezClip = (k.bez || BEZIER_DEFAULT).slice();
+  if (navigator.clipboard) navigator.clipboard.writeText(App.bezClip.join(', ')).catch(() => {});
+  toast('Curve copied: '+App.bezClip.join(', '));
+}
+function pasteCurve(keys = targetKeys()) {
+  if (!App.bezClip) { toast('Copy a curve first.'); return; }
+  if (!keys.length) { toast('Select a keyframe first.'); return; }
+  edit(() => { for (const k of keys) { k.i = 'bezier'; k.bez = App.bezClip.slice(); } });
+  endGesture(); toast('Curve pasted onto '+keys.length+' key'+(keys.length > 1 ? 's' : ''));
+}
 function setBez(b) { const list = bezKeys(); edit(() => { for (const k of list) k.bez = b.map(v => +v.toFixed(3)); }); }
 const bezHandle = (b, x, y) => { const d = i => Math.hypot(bezX(b[i*2])-x, bezY(b[i*2+1])-y); return d(0) <= d(1) ? 0 : 1; };
 bezC.addEventListener('pointerdown', e => {
@@ -3430,6 +3794,8 @@ document.querySelectorAll('[data-bn]').forEach(input => input.addEventListener('
   b[i] = i%2 ? clamp(v, BEZ_LO, BEZ_HI) : clamp(v, 0, 1);
   setBez(b);
 }));
+$('bezCopy').addEventListener('click', () => copyCurve());
+$('bezPaste').addEventListener('click', () => pasteCurve());
 document.querySelectorAll('[data-bez]').forEach(b => b.addEventListener('click', () => { setBez(b.dataset.bez.split(',').map(Number)); endGesture(); }));
 $('exFolder').addEventListener('click', async () => {
   if (!window.showDirectoryPicker) { toast('This browser can only save to Downloads.'); return; }
@@ -3440,7 +3806,7 @@ $('exCancel').addEventListener('click', () => $('exportDlg').close());
 $('exGo').addEventListener('click', () => runExport().catch(err => toast('Export failed: '+err.message, 5000)));
 
 window.addEventListener('keydown', e => {
-  if (document.querySelector('dialog[open]')) return;
+  if (menuKey(e) || document.querySelector('dialog[open]')) return;
   const typing = e.target.matches('input:not([type=range]):not([type=checkbox]), select');
   const ctrl = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
   if (ctrl && k === 'z') { e.preventDefault(); undo(); return; }
@@ -3448,6 +3814,8 @@ window.addEventListener('keydown', e => {
   if (ctrl && k === 's') { e.preventDefault(); saveProject(); return; }
   if (typing) return;
   if (e.target.matches('input[type=range]') && /^(Arrow|Home$|End$|Page)/.test(e.key)) return;
+  if (ctrl && e.shiftKey && k === 'c') { copyCurve(); return; }
+  if (ctrl && e.shiftKey && k === 'v') { pasteCurve(); return; }
   if (ctrl && k === 'c') { copyKeys(); return; }
   if (ctrl && k === 'v') { pasteKeys(); return; }
   if (e.key === ' ') { e.preventDefault(); togglePlay(); }
